@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+
+  # ── FastAPI + Playwright backend ────────────────────────────────────────────
+  backend:
+    build:
+      context: "./MapScraper Pro Backend"
+      dockerfile: Dockerfile
+    container_name: mapscraper_backend
+    restart: unless-stopped
+    # Internal-only — NOT exposed to host; frontend nginx proxies to it
+    expose:
+      - "8100"
+    environment:
+      - PYTHONUNBUFFERED=1
+    # Playwright needs a writable /tmp and shared memory
+    shm_size: "1gb"
+    tmpfs:
+      - /tmp
+    networks:
+      - mapscraper_net
+
+  # ── Nginx frontend ─────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: "./MapScraper Pro"
+      dockerfile: Dockerfile
+    container_name: mapscraper_frontend
+    restart: unless-stopped
+    ports:
+      - "8180:8180"        # <-- unique port; change if taken on your VPS
+    depends_on:
+      - backend
+    networks:
+      - mapscraper_net
+
+networks:
+  mapscraper_net:
+    driver: bridge
