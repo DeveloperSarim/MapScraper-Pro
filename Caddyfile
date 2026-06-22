@@ -1,0 +1,14 @@
+maps.sarimtools.com {
+    # Auto SSL via Let's Encrypt (Caddy handles this automatically)
+    encode gzip
+
+    # Proxy everything to frontend nginx container
+    reverse_proxy frontend:8180 {
+        # SSE (Server-Sent Events) streaming ke liye
+        flush_interval -1
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}

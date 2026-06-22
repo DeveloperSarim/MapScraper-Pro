@@ -1,61 +1,96 @@
 # MapScraper Pro v20
 
-Google Maps business data extractor with a FastAPI + Playwright backend and a static HTML/React frontend.
+Google Maps business data extractor — FastAPI + Playwright backend, static HTML/React frontend.
 
 ## Architecture
 
 ```
-Port 8180 (public)
-    └── Nginx (frontend)
-            ├── Serves  static HTML/JS/CSS
-            └── Proxies /api/* → backend:8100 (internal)
-                                    └── FastAPI + Playwright (Chromium)
+maps.sarimtools.com (port 443 HTTPS)
+    └── Caddy (auto SSL via Let's Encrypt)
+            └── Nginx frontend (internal: 8180)
+                    └── /api/* proxied → FastAPI backend (internal: 8100)
+                                              └── Playwright / Chromium
 ```
 
-## 🐳 Deploy with Docker Compose (VPS)
+---
 
-### Requirements
-- Docker ≥ 24
-- Docker Compose ≥ 2
+## 🐳 Deploy on VPS with Domain (maps.sarimtools.com)
 
-### One-command deploy
+### Step 1 — DNS Setup (Cloudflare / Domain Registrar)
+
+Add this DNS A record:
+
+| Type | Name | Value | TTL |
+|------|------|-------|-----|
+| A | maps | `147.93.122.121` | Auto |
+
+> Wait 2–5 minutes for DNS to propagate.
+
+### Step 2 — VPS Setup
 
 ```bash
-# Clone repo
-git clone https://github.com/YOUR_USERNAME/mapscraper-pro.git
-cd mapscraper-pro
+# SSH into your VPS
+ssh root@147.93.122.121
 
-# Build & start (first run downloads Chromium ~300MB)
+# Clone the repo
+git clone https://github.com/DeveloperSarim/MapScraper-Pro.git
+cd MapScraper-Pro
+
+# IMPORTANT: Make sure ports 80 and 443 are free
+# Check what's using them:
+lsof -i :80
+lsof -i :443
+# If another nginx/caddy is running on the VPS, stop it first:
+# systemctl stop nginx   (if host nginx is running)
+
+# Build and start everything
 docker compose up -d --build
 
-# Check logs
-docker compose logs -f
+# Caddy will auto-fetch SSL cert for maps.sarimtools.com
+# This takes ~30 seconds on first start
+docker compose logs -f caddy
 ```
 
-App is now live at → **http://YOUR_VPS_IP:8180**
+### Step 3 — Verify
 
-### Useful commands
+```bash
+# Check all containers running
+docker compose ps
+
+# Test SSL
+curl https://maps.sarimtools.com/api/v1/health
+# Expected: {"status":"ok","backend":"playwright"}
+```
+
+🎉 App live at: **https://maps.sarimtools.com**
+
+---
+
+## 🔄 Update Deployment
+
+```bash
+cd MapScraper-Pro
+git pull
+docker compose up -d --build
+```
+
+---
+
+## 📋 Useful Commands
 
 | Action | Command |
 |--------|---------|
 | Start | `docker compose up -d` |
 | Stop | `docker compose down` |
 | Rebuild | `docker compose up -d --build` |
+| All logs | `docker compose logs -f` |
 | Backend logs | `docker compose logs -f backend` |
-| Frontend logs | `docker compose logs -f frontend` |
+| Caddy SSL logs | `docker compose logs -f caddy` |
 | Shell into backend | `docker compose exec backend bash` |
 
-### Ports
+---
 
-| Service | Container Port | Host Port |
-|---------|---------------|-----------|
-| Frontend (Nginx) | 8180 | **8180** |
-| Backend (FastAPI) | 8100 | internal only |
-
-> The backend is NOT exposed to the host — only the frontend Nginx container can reach it.
-> Change the host port in `docker-compose.yml` if `8180` is already taken on your VPS.
-
-## 🖥️ Run Locally (without Docker)
+## 🖥️ Run Locally (no Docker)
 
 ```bash
 # Backend
@@ -64,8 +99,14 @@ pip install -r requirements.txt
 playwright install chromium
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
-# Frontend (separate terminal)
+# Frontend (new terminal)
 cd "MapScraper Pro"
 python3 -m http.server 8788
 # Open http://localhost:8788
 ```
+
+---
+
+## ⚠️ Port Conflict Note
+
+If ports 80/443 are already used by another app on your VPS (e.g., Nginx Proxy Manager), see `docs/nginx-host-proxy.md` for the alternative setup.

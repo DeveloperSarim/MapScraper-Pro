@@ -9,31 +9,52 @@ services:
       dockerfile: Dockerfile
     container_name: mapscraper_backend
     restart: unless-stopped
-    # Internal-only — NOT exposed to host; frontend nginx proxies to it
     expose:
       - "8100"
     environment:
       - PYTHONUNBUFFERED=1
-    # Playwright needs a writable /tmp and shared memory
     shm_size: "1gb"
     tmpfs:
       - /tmp
     networks:
       - mapscraper_net
 
-  # ── Nginx frontend ─────────────────────────────────────────────────────────
+  # ── Nginx frontend ──────────────────────────────────────────────────────────
   frontend:
     build:
       context: "./MapScraper Pro"
       dockerfile: Dockerfile
     container_name: mapscraper_frontend
     restart: unless-stopped
-    ports:
-      - "8180:8180"        # <-- unique port; change if taken on your VPS
+    # Internal only — Caddy proxies to this
+    expose:
+      - "8180"
     depends_on:
       - backend
     networks:
       - mapscraper_net
+
+  # ── Caddy — Auto SSL + Domain Routing ──────────────────────────────────────
+  # maps.sarimtools.com → HTTPS (auto Let's Encrypt cert)
+  caddy:
+    image: caddy:2-alpine
+    container_name: mapscraper_caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"     # HTTP → auto redirect to HTTPS
+      - "443:443"   # HTTPS (maps.sarimtools.com)
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data          # SSL certs stored here (persistent)
+      - caddy_config:/config
+    depends_on:
+      - frontend
+    networks:
+      - mapscraper_net
+
+volumes:
+  caddy_data:    # Keeps SSL certs across restarts
+  caddy_config:
 
 networks:
   mapscraper_net:
