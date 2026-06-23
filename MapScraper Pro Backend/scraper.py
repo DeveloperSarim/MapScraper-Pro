@@ -62,15 +62,16 @@ async def _get_detail_info(context, url: str) -> dict:
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
 
-        # Smart wait: stop as soon as key elements appear (max 3s)
+        # Smart wait: stop as soon as key elements appear (max 4s)
         try:
             await page.locator(
                 '[data-item-id^="phone:tel:"], '
                 '[data-item-id="authority"], '
                 'a[href^="tel:"]'
-            ).first.wait_for(timeout=3_000)
+            ).first.wait_for(timeout=4_000)
         except Exception:
-            pass  # Elements not found in time — still try below
+            # Fallback: wait a bit for JS rendering
+            await page.wait_for_timeout(2_000)
 
         # ── PHONE ─────────────────────────────────────────────────────────
 
@@ -104,29 +105,69 @@ async def _get_detail_info(context, url: str) -> dict:
 
         # ── WEBSITE ───────────────────────────────────────────────────────
 
-        # Method 1: data-item-id="authority" (Google Maps official website btn)
+        # Method 1: data-item-id="authority" — primary Google Maps identifier
+        # Could be on the <a> tag directly or a parent container
         web_item = page.locator('[data-item-id="authority"]')
         if await web_item.count() > 0:
+            # Try direct href on the element
             website = await web_item.first.get_attribute("href") or ""
 
-        # Method 2: aria-label containing "website"
-        if not website:
-            web_btn = page.locator('a[aria-label*="website" i], a[data-tooltip*="website" i]')
-            if await web_btn.count() > 0:
-                website = await web_btn.first.get_attribute("href") or ""
+            # Try child <a> tag (common pattern: <div data-item-id><a href>)
+            if not website:
+                child_a = web_item.first.locator('a[href^="http"]')
+                if await child_a.count() > 0:
+                    website = await child_a.first.get_attribute("href") or ""
 
-        # Method 3: any external http link in the detail panel (not google.com)
+            # Fallback: use inner text as domain (e.g. "ihg.com")
+            if not website:
+                text = (await web_item.first.inner_text()).strip()
+                # Valid domain: has dot, no spaces, reasonable length
+                if text and "." in text and " " not in text and len(text) < 80:
+                    website = f"https://{text}" if not text.startswith("http") else text
+
+        # Method 2: anchor class used by Google Maps for website links
         if not website:
-            links = page.locator('a[href^="http"]')
-            for i in range(min(await links.count(), 10)):
-                href = await links.nth(i).get_attribute("href") or ""
-                if href and "google." not in href and "maps." not in href:
+            cls_links = page.locator('a.CsEnBe[href^="http"], a.rogA2c[href^="http"]')
+            for i in range(min(await cls_links.count(), 5)):
+                href = await cls_links.nth(i).get_attribute("href") or ""
+                if href and "google." not in href and "goo.gl" not in href:
                     website = href
                     break
 
-        # Clean website URL
+        # Method 3: aria-label containing "website"
+        if not website:
+            for sel in [
+                'a[aria-label*="website" i]',
+                'a[data-tooltip*="website" i]',
+                '[aria-label*="Open website" i]',
+            ]:
+                wb = page.locator(sel)
+                if await wb.count() > 0:
+                    href = await wb.first.get_attribute("href") or ""
+                    if not href:
+                        ca = wb.first.locator('a')
+                        if await ca.count() > 0:
+                            href = await ca.first.get_attribute("href") or ""
+                    if href and "google." not in href:
+                        website = href
+                        break
+
+        # Method 4: Scan all external links — skip known non-website domains
+        SKIP = {"google.", "goo.gl", "maps.", "apple.com/maps",
+                "facebook.com", "instagram.com", "twitter.com",
+                "youtube.com", "yelp.com", "tripadvisor."}
+        if not website:
+            links = page.locator('a[href^="http"]')
+            for i in range(min(await links.count(), 25)):
+                href = await links.nth(i).get_attribute("href") or ""
+                if href and not any(s in href for s in SKIP):
+                    website = href
+                    break
+
+        # Clean website URL — remove tracking params but keep path
         if website:
-            website = website.split("?")[0].rstrip("/")
+            # Remove utm_* and similar tracking params
+            website = re.sub(r'[?&]utm_[^&]*', '', website).rstrip('?&/')
 
     except Exception:
         pass
