@@ -299,7 +299,7 @@ async def scrape(
                             address = s
                             break
 
-                    # Quick phone/website from list card (fast, often empty)
+                    # Quick phone from list card
                     phone   = ""
                     website = ""
 
@@ -312,20 +312,61 @@ async def scrape(
                             t = await tel_el.first.get_attribute("href") or ""
                             phone = t.replace("tel:", "").strip()
 
-                    web_el = card.locator('a[data-value="Website"]')
-                    if await web_el.count() > 0:
-                        website = await web_el.first.get_attribute("href") or ""
+                    # ── Website: parse card raw HTML (most reliable) ──────────
+                    # Google Maps encodes website as direct URL or /url?q= redirect
+                    _SKIP = ("google.", "goo.gl", "maps.", "googleapis.",
+                             "facebook.", "instagram.", "twitter.com",
+                             "youtube.", "yelp.", "tripadvisor.")
+                    try:
+                        card_html = await card.evaluate("el => el.outerHTML")
 
-                    # Maps link
+                        # Method A: /url?q=https://... (Google redirect)
+                        redirects = re.findall(
+                            r'(?:url\?q=|\\u002Furl\\u003Fq\\u003D)'
+                            r'(https?://[^&"\\<>\s]+)',
+                            card_html
+                        )
+                        for u in redirects:
+                            u = (u.replace('\\u002F', '/')
+                                  .replace('\\u003F', '?')
+                                  .replace('\\u003D', '=')
+                                  .replace('\\u0026', '&'))
+                            if not any(d in u for d in _SKIP):
+                                website = u.split('"')[0].split("'")[0].rstrip('/')
+                                break
+
+                        # Method B: Direct external https:// in card HTML
+                        if not website:
+                            directs = re.findall(r'https?://[^\s"\'\\ <>&#]+', card_html)
+                            for u in directs:
+                                u = u.rstrip('/,;)')
+                                if not any(d in u for d in _SKIP) and '.' in u:
+                                    website = u
+                                    break
+
+                    except Exception:
+                        pass
+
+                    # Maps link — use actual place href when available
                     maps_link = (
                         f"https://www.google.com/maps/search/"
                         f"{quote(name)}/@{b_lat},{b_lng},17z"
                     )
-                    if href:
-                        maps_link = (
-                            "https://www.google.com" + href
-                            if href.startswith("/maps") else href
-                        )
+                    # Try to find any link in card that goes to a place page
+                    for sel in [
+                        'a[href*="/maps/place/"]',
+                        'a[href*="maps/place"]',
+                        'a[href^="/maps"]',
+                    ]:
+                        lk = card.locator(sel)
+                        if await lk.count() > 0:
+                            h = await lk.first.get_attribute("href") or ""
+                            if h:
+                                maps_link = (
+                                    "https://www.google.com" + h
+                                    if h.startswith("/") else h
+                                )
+                                break
 
                     batch_businesses.append({
                         "name":      name,
