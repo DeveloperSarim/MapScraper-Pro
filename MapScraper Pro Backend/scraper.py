@@ -1,7 +1,7 @@
 """
-Google Maps Playwright scraper — v2
-Streams business results as dicts; caller handles SSE formatting.
-Phone numbers are extracted from detail pages for maximum reliability.
+Google Maps Playwright scraper — v3
+Speed optimized: phone + website fetched in ONE detail page visit.
+Concurrent detail fetches with smart element-based waiting.
 """
 import asyncio
 import re
@@ -50,65 +50,90 @@ def _parse_coord(href: str):
     return None, None
 
 
-async def _get_phone_from_detail(context, url: str) -> str:
+async def _get_detail_info(context, url: str) -> dict:
     """
-    Open a business detail page in a new tab and extract the phone number
-    using multiple fallback selectors. Returns empty string if not found.
+    Open a business detail page in a new tab.
+    Returns {phone, website} — both in ONE visit for speed.
+    Smart element-based waiting instead of fixed sleep.
     """
     page = await context.new_page()
-    phone = ""
+    phone   = ""
+    website = ""
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-        # Wait for the detail panel content to settle
-        await page.wait_for_timeout(2_500)
+        await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
 
-        # ── Method 1: data-item-id="phone:tel:+XXXX" ──────────────────────
+        # Smart wait: stop as soon as key elements appear (max 3s)
+        try:
+            await page.locator(
+                '[data-item-id^="phone:tel:"], '
+                '[data-item-id="authority"], '
+                'a[href^="tel:"]'
+            ).first.wait_for(timeout=3_000)
+        except Exception:
+            pass  # Elements not found in time — still try below
+
+        # ── PHONE ─────────────────────────────────────────────────────────
+
+        # Method 1: data-item-id="phone:tel:+XXXX"
         phone_item = page.locator('[data-item-id^="phone:tel:"]')
         if await phone_item.count() > 0:
             item_id = await phone_item.first.get_attribute("data-item-id") or ""
             phone = item_id.replace("phone:tel:", "").strip()
 
-        # ── Method 2: aria-label="Phone: +XXXX" on button ─────────────────
+        # Method 2: button[aria-label="Phone: +XXXX"]
         if not phone:
             for sel in [
                 'button[aria-label^="Phone:"]',
                 'button[aria-label^="Telefon:"]',
-                'button[aria-label^="Téléphone:"]',
                 'button[aria-label*="phone" i]',
             ]:
                 els = page.locator(sel)
                 if await els.count() > 0:
-                    label = await els.first.get_attribute("aria-label") or ""
-                    m = re.search(r"[\+\d][\d\s\-\(\)\.]{6,}", label)
+                    lbl = await els.first.get_attribute("aria-label") or ""
+                    m = re.search(r"[\+\d][\d\s\-\(\)\.]{6,}", lbl)
                     if m:
                         phone = m.group(0).strip()
                         break
 
-        # ── Method 3: <a href="tel:+XXXX"> ───────────────────────────────
+        # Method 3: <a href="tel:+XXXX">
         if not phone:
             tel_link = page.locator('a[href^="tel:"]')
             if await tel_link.count() > 0:
                 href = await tel_link.first.get_attribute("href") or ""
                 phone = href.replace("tel:", "").strip()
 
-        # ── Method 4: visible span near a phone-icon section ──────────────
-        if not phone:
-            spans = page.locator(
-                '[data-tooltip*="phone" i] span, '
-                '[aria-label*="phone" i] span'
-            )
-            for i in range(min(await spans.count(), 5)):
-                text = (await spans.nth(i).inner_text()).strip()
-                if re.match(r"[\+\d][\d\s\-\(\)]{6,}", text):
-                    phone = text
+        # ── WEBSITE ───────────────────────────────────────────────────────
+
+        # Method 1: data-item-id="authority" (Google Maps official website btn)
+        web_item = page.locator('[data-item-id="authority"]')
+        if await web_item.count() > 0:
+            website = await web_item.first.get_attribute("href") or ""
+
+        # Method 2: aria-label containing "website"
+        if not website:
+            web_btn = page.locator('a[aria-label*="website" i], a[data-tooltip*="website" i]')
+            if await web_btn.count() > 0:
+                website = await web_btn.first.get_attribute("href") or ""
+
+        # Method 3: any external http link in the detail panel (not google.com)
+        if not website:
+            links = page.locator('a[href^="http"]')
+            for i in range(min(await links.count(), 10)):
+                href = await links.nth(i).get_attribute("href") or ""
+                if href and "google." not in href and "maps." not in href:
+                    website = href
                     break
+
+        # Clean website URL
+        if website:
+            website = website.split("?")[0].rstrip("/")
 
     except Exception:
         pass
     finally:
         await page.close()
 
-    return phone
+    return {"phone": phone, "website": website}
 
 
 async def scrape(
@@ -121,8 +146,7 @@ async def scrape(
 ):
     """
     Async generator — yields business dicts one by one.
-    Stays within radius_m metres of (lat, lng).
-    Phone numbers are fetched from each business's detail page.
+    Phone + website fetched from detail page in one concurrent visit.
     """
     query    = f"{category} near {location}" if location else category
     zoom     = 14
@@ -142,17 +166,17 @@ async def scrape(
     )
     page = await context.new_page()
 
-    # Limit concurrent detail-page fetches to avoid overloading
-    sem = asyncio.Semaphore(3)
+    # ── 5 concurrent detail-page fetches (was 3) ──────────────────────────
+    sem = asyncio.Semaphore(5)
 
-    async def fetch_phone(url: str) -> str:
+    async def fetch_detail(url: str) -> dict:
         async with sem:
-            return await _get_phone_from_detail(context, url)
+            return await _get_detail_info(context, url)
 
     try:
         await page.goto(maps_url, wait_until="domcontentloaded", timeout=30_000)
 
-        # Accept cookie/consent banner if present
+        # Accept cookie banner if present
         try:
             btn = page.locator('button[aria-label*="Accept"]')
             if await btn.count() > 0:
@@ -173,15 +197,17 @@ async def scrape(
         no_new_streak = 0
 
         while count < max_results and no_new_streak < 4:
-            cards    = await page.locator('[role="feed"] > div > div[jsaction]').all()
+            cards     = await page.locator('[role="feed"] > div > div[jsaction]').all()
             batch_new = 0
 
-            for card in cards:
-                if count >= max_results:
-                    break
+            # ── Collect basic info from list view ─────────────────────────
+            batch_businesses = []
 
+            for card in cards:
+                if count + len(batch_businesses) >= max_results:
+                    break
                 try:
-                    # ── Name ──────────────────────────────────────────────
+                    # Name
                     name_el = card.locator(".qBF1Pd")
                     if await name_el.count() == 0:
                         name_el = card.locator("div[class*='fontHeadlineSmall']")
@@ -191,7 +217,7 @@ async def scrape(
                     if not name or name in seen:
                         continue
 
-                    # ── Maps link / coords ────────────────────────────────
+                    # Link / coords
                     link_el = card.locator('a[href*="/maps/place/"]')
                     href    = ""
                     if await link_el.count() > 0:
@@ -201,14 +227,13 @@ async def scrape(
                     if b_lat is None:
                         b_lat, b_lng = lat, lng
 
-                    # Radius filter
                     if _haversine_m(lat, lng, b_lat, b_lng) > radius_m * 1.5:
                         continue
 
                     seen.add(name)
                     batch_new += 1
 
-                    # ── Rating ────────────────────────────────────────────
+                    # Rating
                     rating = 0.0
                     rating_el = card.locator(".MW4etd")
                     if await rating_el.count() > 0:
@@ -217,14 +242,14 @@ async def scrape(
                         except ValueError:
                             pass
 
-                    # ── Reviews ───────────────────────────────────────────
+                    # Reviews
                     reviews = 0
                     rev_el  = card.locator(".UY7F9")
                     if await rev_el.count() > 0:
                         rev_raw = re.sub(r"[^\d]", "", await rev_el.first.inner_text())
                         reviews = int(rev_raw) if rev_raw else 0
 
-                    # ── Address ───────────────────────────────────────────
+                    # Address
                     spans   = await card.locator(".W4Efsd span").all_inner_texts()
                     address = ""
                     for s in spans:
@@ -233,37 +258,24 @@ async def scrape(
                             address = s
                             break
 
-                    # ── Phone — list view (fast, often empty on new Maps) ─
-                    phone = ""
+                    # Quick phone/website from list card (fast, often empty)
+                    phone   = ""
+                    website = ""
 
-                    # Try data-dtype (legacy selector)
                     ph_el = card.locator('[data-dtype="d3ph"]')
                     if await ph_el.count() > 0:
                         phone = (await ph_el.first.inner_text()).strip()
-
-                    # Try tel: link in card
                     if not phone:
                         tel_el = card.locator('a[href^="tel:"]')
                         if await tel_el.count() > 0:
                             t = await tel_el.first.get_attribute("href") or ""
                             phone = t.replace("tel:", "").strip()
 
-                    # Try aria-label in card
-                    if not phone:
-                        aria_el = card.locator('[aria-label*="phone" i]')
-                        if await aria_el.count() > 0:
-                            lbl = await aria_el.first.get_attribute("aria-label") or ""
-                            m = re.search(r"[\+\d][\d\s\-\(\)]{6,}", lbl)
-                            if m:
-                                phone = m.group(0).strip()
-
-                    # ── Website ───────────────────────────────────────────
-                    website = ""
-                    web_el  = card.locator('a[data-value="Website"]')
+                    web_el = card.locator('a[data-value="Website"]')
                     if await web_el.count() > 0:
                         website = await web_el.first.get_attribute("href") or ""
 
-                    # ── Maps link ─────────────────────────────────────────
+                    # Maps link
                     maps_link = (
                         f"https://www.google.com/maps/search/"
                         f"{quote(name)}/@{b_lat},{b_lng},17z"
@@ -274,38 +286,70 @@ async def scrape(
                             if href.startswith("/maps") else href
                         )
 
-                    # ── Fetch phone from detail page if still missing ──────
-                    if not phone and maps_link:
-                        try:
-                            phone = await fetch_phone(maps_link)
-                        except Exception:
-                            phone = ""
-
-                    business = {
-                        "name":     name,
-                        "nameAr":   "",
-                        "category": category,
-                        "rating":   rating,
-                        "reviews":  reviews,
-                        "phone":    phone,
-                        "email":    "",
-                        "website":  website,
-                        "address":  address,
-                        "status":   "open",
-                        "price":    "$$",
-                        "lat":      b_lat,
-                        "lng":      b_lng,
-                        "hours":    "",
-                        "services": ["In-store"],
-                        "desc":     "",
-                        "mapsLink": maps_link,
-                        "source":   "google_maps",
-                    }
-                    count += 1
-                    yield business
+                    batch_businesses.append({
+                        "name":      name,
+                        "maps_link": maps_link,
+                        "phone":     phone,
+                        "website":   website,
+                        "rating":    rating,
+                        "reviews":   reviews,
+                        "address":   address,
+                        "lat":       b_lat,
+                        "lng":       b_lng,
+                    })
 
                 except Exception:
                     continue
+
+            # ── Parallel detail fetch for phone+website ───────────────────
+            # Only fetch for businesses missing phone OR website
+            needs_detail = [
+                b for b in batch_businesses
+                if not b["phone"] or not b["website"]
+            ]
+
+            detail_tasks = {
+                b["maps_link"]: asyncio.create_task(fetch_detail(b["maps_link"]))
+                for b in needs_detail
+            }
+
+            # Yield businesses as detail tasks complete
+            for b in batch_businesses:
+                if count >= max_results:
+                    break
+
+                if b["maps_link"] in detail_tasks:
+                    try:
+                        detail = await detail_tasks[b["maps_link"]]
+                        if not b["phone"]:
+                            b["phone"] = detail.get("phone", "")
+                        if not b["website"]:
+                            b["website"] = detail.get("website", "")
+                    except Exception:
+                        pass
+
+                business = {
+                    "name":     b["name"],
+                    "nameAr":   "",
+                    "category": category,
+                    "rating":   b["rating"],
+                    "reviews":  b["reviews"],
+                    "phone":    b["phone"],
+                    "email":    "",
+                    "website":  b["website"],
+                    "address":  b["address"],
+                    "status":   "open",
+                    "price":    "$$",
+                    "lat":      b["lat"],
+                    "lng":      b["lng"],
+                    "hours":    "",
+                    "services": ["In-store"],
+                    "desc":     "",
+                    "mapsLink": b["maps_link"],
+                    "source":   "google_maps",
+                }
+                count += 1
+                yield business
 
             if batch_new == 0:
                 no_new_streak += 1
@@ -315,10 +359,10 @@ async def scrape(
             if count >= max_results:
                 break
 
-            # Scroll the feed to load more results
+            # Scroll feed to load more
             try:
                 await feed.evaluate("el => el.scrollBy(0, 1200)")
-                await asyncio.sleep(1.8)
+                await asyncio.sleep(1.5)
             except Exception:
                 break
 
