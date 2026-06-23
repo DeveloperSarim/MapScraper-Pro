@@ -74,16 +74,16 @@ async def _get_phone_from_detail(context, url: str) -> str:
 
     phone = ""
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
         
         # Wait for the main detail title to render
         try:
-            await page.wait_for_selector("h1.DUwDvf", timeout=5_000)
+            await page.wait_for_selector("h1.DUwDvf", timeout=4_000)
         except Exception:
             pass
 
         # Give it a tiny moment to render dynamic widgets
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(250)
 
         # Extract phone number in single in-page JS evaluate
         phone = await page.evaluate("""
@@ -165,7 +165,7 @@ async def scrape(
     page = await context.new_page()
 
     # Limit concurrent detail-page fetches to avoid overloading
-    sem = asyncio.Semaphore(5)
+    sem = asyncio.Semaphore(12)
 
     async def fetch_phone(url: str) -> str:
         async with sem:
@@ -353,7 +353,7 @@ async def scrape(
                 # Scroll the feed to load more results
                 try:
                     await feed.evaluate("el => el.scrollBy(0, 1200)")
-                    await asyncio.sleep(1.8)
+                    await asyncio.sleep(0.8)
                 except Exception:
                     break
 
