@@ -65,9 +65,12 @@ async def scrape_stream(body: ScrapeRequest, request: Request):
                 if await request.is_disconnected():
                     log.info("Client disconnected, stopping scrape")
                     break
-                payload = json.dumps({"type": "business", "data": biz})
+                if biz.get("_phone_update"):
+                    payload = json.dumps({"type": "phone_update", "name": biz["name"], "phone": biz["phone"]})
+                else:
+                    payload = json.dumps({"type": "business", "data": biz})
+                    count += 1
                 yield f"data: {payload}\n\n"
-                count += 1
 
         except Exception as exc:
             log.exception("Scrape error: %s", exc)

@@ -827,7 +827,7 @@ async function checkBackend() {
 }
 
 // Streams results from backend; calls onBusiness(b) for each as it arrives
-async function fetchFromBackend(lat, lng, radiusM, categories, onProgress, onBusiness, locationStr) {
+async function fetchFromBackend(lat, lng, radiusM, categories, onProgress, onBusiness, locationStr, onPhoneUpdate) {
   const allResults = [];
   const seenKeys = new Set();
 
@@ -880,6 +880,12 @@ async function fetchFromBackend(lat, lng, radiusM, categories, onProgress, onBus
                       if (onProgress) onProgress(allResults.length);
                     }
                   }
+                } else if (msg.type === "phone_update" && msg.name && msg.phone) {
+                    const b = allResults.find(r => r.name === msg.name);
+                    if (b) {
+                      b.phone = msg.phone;
+                      if (onPhoneUpdate) onPhoneUpdate(msg.name, msg.phone);
+                    }
                 } else if (msg.type === "done" || msg.type === "error") {
                   resolve(); return;
                 }
@@ -928,11 +934,11 @@ function dedup(businesses) {
   });
 }
 
-async function fetchBusinessesFromOverpass(lat, lng, radiusM, categories, onProgress, onBusiness, locationStr) {
+async function fetchBusinessesFromOverpass(lat, lng, radiusM, categories, onProgress, onBusiness, locationStr, onPhoneUpdate) {
   // ── Priority 1: Local Playwright backend (no API key, real Google Maps data) ─
   const backendUp = await checkBackend();
   if (backendUp) {
-    const results = await fetchFromBackend(lat, lng, radiusM, categories, onProgress, onBusiness, locationStr);
+    const results = await fetchFromBackend(lat, lng, radiusM, categories, onProgress, onBusiness, locationStr, onPhoneUpdate);
     if (results.length > 0) return results;
     // backend returned 0, fall through to next source
   }

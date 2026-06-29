@@ -1,6 +1,6 @@
 // MapScraper Pro — top bar
 function TopBar({ state, on }) {
-  const { lang, view, total, running, search, exportOpen, columnsOpen, filterOpen, geo, categories } = state;
+  const { lang, view, total, found, running, search, exportOpen, columnsOpen, filterOpen, geo, categories } = state;
   const ar = lang === "ar";
   const viewOpts = [
     { id: "split", label: ar ? "مقسم" : "Split View", ic: I.split },
@@ -32,7 +32,8 @@ function TopBar({ state, on }) {
         </span>
         <span className="badge" style={{ marginLeft: 8 }}>
           {running && <span className="pulse" />}
-          <span>{total} {ar ? "نتيجة" : "businesses"}</span>
+          <span>{found ?? total} {ar ? "نتيجة" : "businesses"}</span>
+          {!running && total < (found ?? total) && <span style={{ opacity: 0.55, fontSize: "0.8em", marginLeft: 4 }}>({total} shown)</span>}
         </span>
       </div>
 

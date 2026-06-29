@@ -209,6 +209,10 @@ function App() {
     let bizIdSeq = 1;
     const uiSeenKeys = new Set();
 
+    const onPhoneUpdate = (name, phone) => {
+      setBusinesses(prev => prev.map(b => b.name === name && !b.phone ? { ...b, phone } : b));
+    };
+
     const onBusiness = (b) => {
       const normName = (b.name || "").toLowerCase().replace(/[^a-z0-9؀-ۿ]/g, "").slice(0, 20);
       const coordKey = b.lat ? `${(+b.lat).toFixed(3)}_${(+b.lng).toFixed(3)}` : "";
@@ -231,7 +235,7 @@ function App() {
         if (!coords) continue;
         const locStr = `${district}, ${city}, ${countryName}`;
         setToast(`Scraping ${district}…`);
-        await window.fetchBusinessesFromOverpass(coords.lat, coords.lng, radiusM, cats, null, onBusiness, locStr);
+        await window.fetchBusinessesFromOverpass(coords.lat, coords.lng, radiusM, cats, null, onBusiness, locStr, onPhoneUpdate);
       }
     } catch (err) {
       console.error("Multi-area scrape error:", err);
@@ -264,6 +268,10 @@ function App() {
     // Track seen names/coords in the UI to catch any duplicates the backend missed
     const uiSeenKeys = new Set();
 
+    const onPhoneUpdate = (name, phone) => {
+      setBusinesses(prev => prev.map(b => b.name === name && !b.phone ? { ...b, phone } : b));
+    };
+
     // onBusiness: called for each result as it streams in from backend
     const onBusiness = (b) => {
       const normName = (b.name || "").toLowerCase().replace(/[^a-z0-9؀-ۿ]/g, "").slice(0, 20);
@@ -287,7 +295,7 @@ function App() {
     };
 
     try {
-      const results = await window.fetchBusinessesFromOverpass(lat, lng, radiusM, cats, null, onBusiness, locationStr);
+      const results = await window.fetchBusinessesFromOverpass(lat, lng, radiusM, cats, null, onBusiness, locationStr, onPhoneUpdate);
       clearInterval(logTimer);
 
       // If no streaming happened (OSM path), apply results now
@@ -555,7 +563,7 @@ function App() {
 
   const hasPolygon = !!(polygonSearch?.polygon?.length >= 3) && !polygonSearch?.active;
   const sideState = { lang, geo, categories, keywords, radius, maxResults, running, found, total: filtered.length, logIdx, recent, pfState: on.pfState, hasResults: businesses.length > 0, hasPolygon };
-  const topState  = { lang, view, total: filtered.length, running, search, exportOpen, filterOpen, activeFilters, geo, categories };
+  const topState  = { lang, view, total: filtered.length, found, running, search, exportOpen, filterOpen, activeFilters, geo, categories };
   const mapProps  = {
     businesses: filtered, active: active?.id, onSelect: (id) => { setActiveId(id); setDetailOpen(true); },
     running, found, mapMode, setMapMode, satellite, setSatellite, geo,

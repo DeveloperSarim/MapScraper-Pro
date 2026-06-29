@@ -1,12 +1,11 @@
 """
-Google Maps Playwright scraper — v3 (Optimized & Reliable)
+Google Maps Playwright scraper — v3 (Optimized)
 Streams business results as dicts; caller handles SSE formatting.
 Concurrent detail fetches with asyncio.Queue and in-page JS evaluation.
 """
 import asyncio
 import re
 import math
-import random
 import logging
 from urllib.parse import quote
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -54,96 +53,84 @@ def _parse_coord(href: str):
     return None, None
 
 
-async def _get_detail_info(context, url: str) -> dict:
+async def _get_phone_from_detail(context, url: str) -> str:
     """
-    Open a business detail page in a new tab and extract both the phone number
-    and full address using stable selectors executed in-page in JS.
-    Returns {"phone": str, "address": str}.
+    Open a business detail page in a new tab and extract the phone number
+    using multiple fallback selectors executed in-page in JS.
+    Returns empty string if not found.
     """
     page = await context.new_page()
     
-    # Speed Optimization: Abort heavy assets (images, media, fonts) to load faster
+    # Abort heavy/non-essential assets to load faster
     try:
         await page.route(
             "**/*",
             lambda route: route.abort()
-            if route.request.resource_type in ["image", "media", "font"]
+            if route.request.resource_type in ["image", "media", "font", "stylesheet"]
             else route.continue_()
         )
     except Exception:
         pass
 
-    result = {"phone": "", "address": ""}
+    phone = ""
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
         
-        # Wait for the main detail title to render
+        # Wait for the main detail title to render (fail fast — fallbacks handle missing data)
         try:
-            await page.wait_for_selector("h1.DUwDvf", timeout=4_000)
+            await page.wait_for_selector("h1.DUwDvf", timeout=2_000)
         except Exception:
             pass
 
-        # Give it a tiny moment to render dynamic widgets
-        await page.wait_for_timeout(300)
+        # Brief settle for dynamic widgets
+        await page.wait_for_timeout(100)
 
-        # Extract details in single in-page JS evaluate
-        extracted = await page.evaluate("""
+        # Extract phone number in single in-page JS evaluate
+        phone = await page.evaluate("""
             () => {
-                // 1. Phone extraction
-                let phone = "";
+                // 1. data-item-id="phone:tel:+XXXX"
                 const phoneItem = document.querySelector('[data-item-id^="phone:tel:"]');
                 if (phoneItem) {
                     const itemId = phoneItem.getAttribute("data-item-id") || "";
-                    phone = itemId.replace("phone:tel:", "").trim();
+                    const val = itemId.replace("phone:tel:", "").trim();
+                    if (val) return val;
                 }
                 
-                if (!phone) {
-                    const phoneBtn = document.querySelector('button[aria-label*="phone" i], button[aria-label^="Phone:"], button[aria-label^="Telefon:"], button[aria-label^="Téléphone:"]');
-                    if (phoneBtn) {
-                        const label = phoneBtn.getAttribute("aria-label") || "";
-                        const m = label.match(/[\\+\\d][\\d\\s\\-\\(\\)\\.]{6,}/);
-                        if (m) phone = m[0].trim();
+                // 2. aria-label="Phone: +XXXX" or similar
+                const phoneBtn = document.querySelector('button[aria-label*="phone" i], button[aria-label^="Phone:"], button[aria-label^="Telefon:"], button[aria-label^="Téléphone:"]');
+                if (phoneBtn) {
+                    const label = phoneBtn.getAttribute("aria-label") || "";
+                    const m = label.match(/[\\+\\d][\\d\\s\\-\\(\\)\\.]{6,}/);
+                    if (m) return m[0].trim();
+                }
+                
+                // 3. tel: link
+                const telLink = document.querySelector('a[href^="tel:"]');
+                if (telLink) {
+                    const href = telLink.getAttribute("href") || "";
+                    const val = href.replace("tel:", "").trim();
+                    if (val) return val;
+                }
+                
+                // 4. visible span inside phone tooltip sections
+                const spans = Array.from(document.querySelectorAll('[data-tooltip*="phone" i] span, [aria-label*="phone" i] span'));
+                for (const span of spans) {
+                    const text = span.innerText.trim();
+                    if (/[\\+\\d][\\d\\s\\-\\(\\)]{6,}/.test(text)) {
+                        return text;
                     }
                 }
                 
-                if (!phone) {
-                    const telLink = document.querySelector('a[href^="tel:"]');
-                    if (telLink) {
-                        const href = telLink.getAttribute("href") || "";
-                        phone = href.replace("tel:", "").trim();
-                    }
-                }
-                
-                if (!phone) {
-                    const spans = Array.from(document.querySelectorAll('[data-tooltip*="phone" i] span, [aria-label*="phone" i] span'));
-                    for (const span of spans) {
-                        const text = span.innerText.trim();
-                        if (/[\\+\\d][\\d\\s\\-\\(\\)]{6,}/.test(text)) {
-                            phone = text;
-                            break;
-                        }
-                    }
-                }
-                
-                // 2. Address extraction
-                let address = "";
-                const addressItem = document.querySelector('[data-item-id="address"]');
-                if (addressItem) {
-                    address = addressItem.innerText.trim().replace(/^\\ue0c8\\n/, '').trim();
-                }
-                
-                return { phone, address };
+                return "";
             }
         """)
-        if extracted:
-            result.update(extracted)
 
     except Exception:
         pass
     finally:
         await page.close()
 
-    return result
+    return phone or ""
 
 
 async def scrape(
@@ -157,7 +144,7 @@ async def scrape(
     """
     Async generator — yields business dicts one by one.
     Stays within radius_m metres of (lat, lng).
-    Fetches phone numbers and full addresses concurrently in the background.
+    Fetches phone numbers concurrently in the background using asyncio.Queue.
     """
     query    = f"{category} near {location}" if location else category
     zoom     = 14
@@ -177,31 +164,29 @@ async def scrape(
     )
     page = await context.new_page()
 
-    # Moderate Semaphore count to prevent Google Map Captchas/Blocks
-    sem = asyncio.Semaphore(4)
+    # Limit concurrent detail-page fetches
+    sem = asyncio.Semaphore(20)
 
-    async def fetch_details(url: str) -> dict:
+    async def fetch_phone(url: str) -> str:
         async with sem:
-            # Jitter to avoid bot-like bulk requests
-            await asyncio.sleep(random.uniform(0.1, 0.5))
-            return await _get_detail_info(context, url)
+            return await _get_phone_from_detail(context, url)
 
     queue = asyncio.Queue()
     pending_tasks = set()
     scheduled_count = 0
     seen = set()
 
-    async def parse_card_task(biz_data):
-        maps_link = biz_data["mapsLink"]
-        if maps_link:
-            try:
-                details = await fetch_details(maps_link)
-                biz_data["phone"] = details.get("phone") or biz_data["phone"]
-                # Update with the full address if fetched successfully
-                biz_data["address"] = details.get("address") or biz_data["address"]
-            except Exception:
-                pass
-        await queue.put(biz_data)
+    async def phone_enrich_task(biz_data):
+        """Fetch phone in background; push a lightweight update marker to queue."""
+        maps_link = biz_data.get("mapsLink")
+        if not maps_link:
+            return
+        try:
+            phone = await fetch_phone(maps_link)
+            if phone:
+                await queue.put({"_phone_update": True, "name": biz_data["name"], "phone": phone})
+        except Exception:
+            pass
 
     async def main_loop():
         nonlocal scheduled_count
@@ -225,7 +210,7 @@ async def scrape(
 
             no_new_streak = 0
 
-            while scheduled_count < max_results and no_new_streak < 4:
+            while scheduled_count < max_results and no_new_streak < 3:
                 # ── In-page JS Card Parsing to minimize IPC calls ──────────────────
                 cards_data = await page.evaluate("""
                     () => {
@@ -250,48 +235,16 @@ async def scrape(
                                 reviews = parseInt(revRaw) || 0;
                             }
                             
-                            // 1. Extract Address from Card spans (excluding category, hours, phone, rating)
+                            const spans = Array.from(card.querySelectorAll(".W4Efsd span")).map(s => s.innerText);
                             let address = "";
-                            const rows = Array.from(card.querySelectorAll(".W4Efsd"));
-                            for (const row of rows) {
-                                const text = row.innerText.trim();
-                                if (text.includes("·") && !/^(open|closed|opens|closes|reopens|closed until|24 hours)/i.test(text)) {
-                                    const parts = text.split("·").map(p => p.trim());
-                                    if (parts.length >= 2) {
-                                        for (let i = 1; i < parts.length; i++) {
-                                            let part = parts[i].split('\\n')[0].trim();
-                                            if (part.length > 3 && 
-                                                !/^[\ue934\$\\¥\£\€\d\.\\s]+$/.test(part) && 
-                                                !/^(open|closed|opens|closes|reopens|closed until|24 hours)/i.test(part) &&
-                                                !/[\\+\\d][\\d\\s\\-]{7,}/.test(part)) {
-                                                address = part;
-                                                break;
-                                            }
-                                        }
-                                        if (address) break;
-                                    }
+                            for (let s of spans) {
+                                s = s.trim().replace(/^·/, '').trim();
+                                if (s.length > 8 && !/^\\d+(\\.\\d+)?$/.test(s)) {
+                                    address = s;
+                                    break;
                                 }
                             }
                             
-                            if (!address) {
-                                const allSpans = Array.from(card.querySelectorAll(".W4Efsd span")).map(s => s.innerText.trim());
-                                for (let s of allSpans) {
-                                    s = s.replace(/^·/, '').trim().split('\\n')[0].trim();
-                                    if (s.length > 4 && 
-                                        !/^(open|closed|opens|closes|reopens|closed until|24 hours|¥|\\$)/i.test(s) &&
-                                        !/[\\+\\d][\\d\\s\\-]{7,}/.test(s) &&
-                                        !/^\\d+(\\.\\d+)?$/.test(s) &&
-                                        !s.toLowerCase().includes("restaurant") &&
-                                        !s.toLowerCase().includes("cafe") &&
-                                        !s.toLowerCase().includes("shop") &&
-                                        !s.toLowerCase().includes("store")) {
-                                        address = s;
-                                        break;
-                                    }
-                                }
-                            }
-                            
-                            // 2. Extract Phone directly from Card spans/text
                             let phone = "";
                             const phEl = card.querySelector('[data-dtype="d3ph"]');
                             if (phEl) phone = phEl.innerText.trim();
@@ -305,23 +258,8 @@ async def scrape(
                                 const ariaEl = card.querySelector('[aria-label*="phone" i]');
                                 if (ariaEl) {
                                     const lbl = ariaEl.getAttribute('aria-label') || '';
-                                    const m = lbl.match(/[\\+\\d][\\d\\s\\-\\(\\)]{7,}/);
+                                    const m = lbl.match(/[\\+\\d][\\d\\s\\-\\(\\)]{6,}/);
                                     if (m) phone = m[0].trim();
-                                }
-                            }
-                            
-                            if (!phone) {
-                                const cardSpans = Array.from(card.querySelectorAll("span")).map(s => s.innerText.trim());
-                                for (const text of cardSpans) {
-                                    const cleanText = text.replace(/^·/, '').trim();
-                                    const match = cleanText.match(/(?:\\+?\\d{1,3}[- ]?)?\\(?\\d{2,4}\\)?[- ]?\\d{3,4}[- ]?\\d{3,4}/);
-                                    if (match) {
-                                        const digits = match[0].replace(/[^\\d]/g, '');
-                                        if (digits.length >= 9 && digits.length <= 15) {
-                                            phone = match[0].trim();
-                                            break;
-                                        }
-                                    }
                                 }
                             }
                             
@@ -397,13 +335,12 @@ async def scrape(
                         "source":   "google_maps",
                     }
 
-                    # Fetch detail info concurrently if missing phone or address
-                    if (not business["phone"] or not business["address"]) and maps_link:
-                        task = asyncio.create_task(parse_card_task(business))
+                    # Yield business IMMEDIATELY — phone enriched in background
+                    await queue.put(business)
+                    if not business["phone"] and maps_link:
+                        task = asyncio.create_task(phone_enrich_task(business))
                         pending_tasks.add(task)
                         task.add_done_callback(pending_tasks.discard)
-                    else:
-                        await queue.put(business)
 
                 if batch_new == 0:
                     no_new_streak += 1
@@ -416,14 +353,14 @@ async def scrape(
                 # Scroll the feed to load more results
                 try:
                     await feed.evaluate("el => el.scrollBy(0, 1200)")
-                    await asyncio.sleep(0.8)
+                    await asyncio.sleep(0.5)
                 except Exception:
                     break
 
         except Exception as e:
             log.exception("Error in main scraping loop: %s", e)
         finally:
-            # Wait for all running phone/address tasks to complete before closing queue
+            # Wait for all running phone tasks to complete before closing queue
             if pending_tasks:
                 await asyncio.gather(*pending_tasks, return_exceptions=True)
             await queue.put(None)
